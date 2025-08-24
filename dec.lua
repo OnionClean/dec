@@ -128,18 +128,34 @@ function LuauDecompiler:ParseBytecode(bytecode)
     local result = {}
     
     -- Read header
-    local version = reader:readByte()
-    if version < 3 or version > 6 then
-        error("Unsupported bytecode version: " .. tostring(version))
+    local signature = reader:readBytes(4)
+    if not signature or signature ~= "RSB1" then
+        error("Invalid bytecode signature")
     end
+    
+    -- Read version
+    local version = reader:readByte()
     result.version = version
+    
+    -- Debug: Show position and remaining data
+    local remainingBytes = #bytecode - reader.pos + 1
     
     -- Read string table
     local stringCount = reader:readVarInt()
     result.strings = {}
     for i = 1, stringCount do
-        local str = reader:readString()
-        result.strings[i] = str
+        local strLen = reader:readVarInt()
+        if not strLen or strLen <= 0 then
+            result.strings[i] = ""
+        else
+            local str = ""
+            for j = 1, strLen do
+                local byte = reader:readByte()
+                if not byte then break end
+                str = str .. string.char(byte)
+            end
+            result.strings[i] = str
+        end
     end
     
     -- Read proto table count
@@ -166,55 +182,58 @@ function LuauDecompiler:ReadProto(reader, strings)
     local proto = {}
     
     -- Read proto header
-    proto.maxStackSize = reader:readByte()
-    proto.numParams = reader:readByte()
-    proto.numUpvals = reader:readByte()
-    proto.isVararg = reader:readByte() ~= 0
+    proto.maxStackSize = reader:readByte() or 0
+    proto.numParams = reader:readByte() or 0
+    proto.numUpvals = reader:readByte() or 0
+    proto.isVararg = (reader:readByte() or 0) ~= 0
     
     -- Read flags byte if version >= 4
-    proto.flags = reader:readByte()
+    proto.flags = reader:readByte() or 0
     
     -- Read type info size and skip it
-    local typeInfoSize = reader:readVarInt()
+    local typeInfoSize = reader:readVarInt() or 0
     if typeInfoSize > 0 then
         reader.pos = reader.pos + typeInfoSize
     end
     
     -- Read instructions
-    local instrCount = reader:readVarInt()
+    local instrCount = reader:readVarInt() or 0
     proto.instructions = {}
     for i = 1, instrCount do
         local instr = reader:readInt32()
-        table.insert(proto.instructions, instr)
+        if instr then
+            table.insert(proto.instructions, instr)
+        end
     end
     
     -- Read constants
-    local constCount = reader:readVarInt()
+    local constCount = reader:readVarInt() or 0
     proto.constants = {}
     for i = 1, constCount do
         local constType = reader:readByte()
+        if not constType then break end
         local value
         
         if constType == 0 then -- nil
             value = nil
         elseif constType == 1 then -- boolean
-            value = reader:readByte() ~= 0
+            value = (reader:readByte() or 0) ~= 0
         elseif constType == 2 then -- number
             value = reader:readDouble()
         elseif constType == 3 then -- string
-            local strIdx = reader:readVarInt()
-            value = strings[strIdx + 1]
+            local strIdx = reader:readVarInt() or 0
+            value = strings[strIdx + 1] or ""
         elseif constType == 4 then -- import
-            local id = reader:readVarInt()
+            local id = reader:readVarInt() or 0
             value = { type = "import", id = id }
         elseif constType == 5 then -- table
-            local keys = reader:readVarInt()
+            local keys = reader:readVarInt() or 0
             value = { type = "table", size = keys }
             for j = 1, keys do
                 reader:readVarInt()
             end
         elseif constType == 6 then -- closure
-            local protoIdx = reader:readVarInt()
+            local protoIdx = reader:readVarInt() or 0
             value = { type = "closure", proto = protoIdx }
         else
             value = nil
@@ -224,7 +243,7 @@ function LuauDecompiler:ReadProto(reader, strings)
     end
     
     -- Read debug info size and skip
-    local debugSize = reader:readVarInt()
+    local debugSize = reader:readVarInt() or 0
     if debugSize > 0 then
         reader.pos = reader.pos + debugSize
     end
