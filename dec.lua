@@ -127,41 +127,70 @@ function LuauDecompiler:ParseBytecode(bytecode)
     local reader = self:CreateReader(bytecode)
     local result = {}
     
-    -- Read header
+    -- Try to detect format
+    local firstByte = string.byte(bytecode, 1)
     local signature = reader:readBytes(4)
-    if not signature or signature ~= "RSB1" then
-        error("Invalid bytecode signature")
-    end
+    reader.pos = 1 -- Reset position
     
-    -- Read version
-    local version = reader:readByte()
-    result.version = version
-    
-    -- Debug: Show position and remaining data
-    local remainingBytes = #bytecode - reader.pos + 1
-    
-    -- Read string table
-    local stringCount = reader:readVarInt()
-    result.strings = {}
-    for i = 1, stringCount do
-        local strLen = reader:readVarInt()
-        if not strLen or strLen <= 0 then
-            result.strings[i] = ""
-        else
-            local str = ""
-            for j = 1, strLen do
-                local byte = reader:readByte()
-                if not byte then break end
-                str = str .. string.char(byte)
+    if signature == "RSB1" then
+        -- Standard Luau bytecode format
+        reader:readBytes(4) -- Skip signature
+        result.version = reader:readByte()
+        
+        -- Read string table
+        local stringCount = reader:readVarInt()
+        result.strings = {}
+        for i = 1, stringCount do
+            local strLen = reader:readVarInt()
+            if not strLen or strLen <= 0 then
+                result.strings[i] = ""
+            else
+                local str = ""
+                for j = 1, strLen do
+                    local byte = reader:readByte()
+                    if not byte then break end
+                    str = str .. string.char(byte)
+                end
+                result.strings[i] = str
             end
-            result.strings[i] = str
+        end
+        
+    else
+        -- Alternative format - try to parse as direct string table
+        result.version = 1
+        result.strings = {}
+        
+        -- Try to extract strings directly
+        local pos = 1
+        local stringIndex = 1
+        while pos <= #bytecode do
+            local byte = string.byte(bytecode, pos)
+            if byte >= 32 and byte <= 126 then -- Printable ASCII
+                local str = ""
+                while pos <= #bytecode do
+                    local b = string.byte(bytecode, pos)
+                    if b == 0 or b < 32 or b > 126 then
+                        break
+                    end
+                    str = str .. string.char(b)
+                    pos = pos + 1
+                end
+                if #str > 0 then
+                    result.strings[stringIndex] = str
+                    stringIndex = stringIndex + 1
+                end
+            end
+            pos = pos + 1
         end
     end
     
     -- Read proto table count
-    local protoCount = reader:readVarInt()
-    if protoCount > 10000 then
-        error("Invalid proto count: " .. tostring(protoCount))
+    local protoCount = 0
+    if signature == "RSB1" then
+        protoCount = reader:readVarInt() or 0
+        if protoCount > 10000 then
+            error("Invalid proto count: " .. tostring(protoCount))
+        end
     end
     
     result.protos = {}
@@ -501,7 +530,79 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
 end
 
 -- Main decompilation
-function LuauDecompiler:Decompile(proto, bytecodeInfo, level)
+function LuauDecompiler:ReconstructFromStrings(strings)
+    local output = {}
+    
+    -- Look for common Roblox patterns in strings
+    local gameServices = {}
+    local events = {}
+    local methods = {}
+    local properties = {}
+    
+    for _, str in ipairs(strings) do
+        if str then
+            -- Detect game services
+            if str:match("Service$") then
+                table.insert(gameServices, str)
+            -- Detect common events
+            elseif str == "ChildAdded" or str == "ChildRemoved" or str == "Changed" or 
+                   str == "Touched" or str == "Connect" or str == "MouseButton1Click" then
+                table.insert(events, str)
+            -- Detect common methods
+            elseif str == "WaitForChild" or str == "GetChildren" or str == "FindFirstChild" or
+                   str == "Clone" or str == "Destroy" or str == "GetService" then
+                table.insert(methods, str)
+            -- Detect properties
+            elseif str == "Parent" or str == "Name" or str == "Text" or str == "Position" or
+                   str == "Size" or str == "Visible" or str == "Enabled" then
+                table.insert(properties, str)
+            end
+        end
+    end
+    
+    -- Generate reconstructed code based on patterns
+    if #gameServices > 0 then
+        table.insert(output, "-- Game services detected:")
+        for _, service in ipairs(gameServices) do
+            table.insert(output, string.format('local %s = game:GetService("%s")', 
+                         service:gsub("Service$", ""), service))
+        end
+        table.insert(output, "")
+    end
+    
+    if #methods > 0 or #events > 0 then
+        table.insert(output, "-- Script functionality (reconstructed from strings):")
+        for _, method in ipairs(methods) do
+            if method == "WaitForChild" then
+                table.insert(output, "-- WaitForChild calls detected")
+            elseif method == "GetChildren" then
+                table.insert(output, "-- GetChildren calls detected")
+            end
+        end
+        
+        for _, event in ipairs(events) do
+            if event == "Connect" then
+                table.insert(output, "-- Event connections detected")
+            end
+        end
+        table.insert(output, "")
+    end
+    
+    -- Add all strings as comments for reference
+    table.insert(output, "-- All extracted strings:")
+    for i, str in ipairs(strings) do
+        if str and #str > 0 then
+            table.insert(output, string.format('-- [%d] "%s"', i, str))
+        end
+    end
+    
+    if #output == 0 then
+        table.insert(output, "-- No meaningful patterns found in string data")
+        table.insert(output, "-- Raw string count: " .. tostring(#strings))
+    end
+    
+    return output
+end
     level = level or 0
     local output = {}
     
@@ -573,7 +674,23 @@ function decompilev2(input)
     -- Attempt decompilation
     local success, result = pcall(function()
         local bytecodeInfo = LuauDecompiler:ParseBytecode(bytecode)
-        local decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
+        local decompiledCode
+        
+        if #bytecodeInfo.protos == 0 or not bytecodeInfo.mainProto then
+            -- No bytecode protos found, try to reconstruct from strings
+            print("⚠️ No bytecode protos found, attempting string reconstruction...")
+            local reconstructed = LuauDecompiler:ReconstructFromStrings(bytecodeInfo.strings)
+            decompiledCode = table.concat(reconstructed, "\n")
+        else
+            decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
+            
+            -- Add remaining protos
+            for i = 2, #bytecodeInfo.protos do
+                decompiledCode = decompiledCode .. "\n\n-- Proto " .. i .. "\n"
+                decompiledCode = decompiledCode .. LuauDecompiler:Decompile(bytecodeInfo.protos[i], bytecodeInfo, 0)
+            end
+        end
+        
         local elapsed = tick and (tick() - t0) or 0
         
         -- Create header without using os.date which might not be available
@@ -581,14 +698,10 @@ function decompilev2(input)
         if elapsed > 0 then
             header = header .. string.format("-- Time taken: %.6f seconds\n", elapsed)
         end
+        header = header .. "-- String count: " .. tostring(#bytecodeInfo.strings) .. "\n"
+        header = header .. "-- Proto count: " .. tostring(#bytecodeInfo.protos) .. "\n\n"
         
         decompiledCode = header .. decompiledCode
-        
-        -- Add remaining protos
-        for i = 2, #bytecodeInfo.protos do
-            decompiledCode = decompiledCode .. "\n\n-- Proto " .. i .. "\n"
-            decompiledCode = decompiledCode .. LuauDecompiler:Decompile(bytecodeInfo.protos[i], bytecodeInfo, 0)
-        end
         
         -- Write to file if writefile is available
         if writefile then
@@ -600,7 +713,11 @@ function decompilev2(input)
         if elapsed > 0 then
             print(string.format("⏱️ Time: %.6fs", elapsed))
         end
-        print("📏 Instructions processed: " .. tostring(#bytecodeInfo.mainProto.instructions))
+        if bytecodeInfo.mainProto and #bytecodeInfo.mainProto.instructions > 0 then
+            print("📏 Instructions processed: " .. tostring(#bytecodeInfo.mainProto.instructions))
+        else
+            print("📄 String reconstruction mode used")
+        end
         
         return decompiledCode
     end)
