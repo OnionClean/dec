@@ -1,5 +1,5 @@
 --[[
-    Universal Roblox Luau Bytecode Decompiler V2
+    Universal Roblox Luau Bytecode Decompiler V3
     Built for exploit environments with getscriptbytecode access
     Usage: decompilev2(script_instance_or_path)
     
@@ -29,84 +29,86 @@ local OpCodes = {
     [81] = "IDIV", [82] = "IDIVK"
 }
 
--- Bytecode reader with proper varint support
-function LuauDecompiler:ReadProto(reader, strings)
-    local function parse(bodyHasFlags)
-        local proto = {}
-        proto.maxStackSize = reader:readByte() or 0
-        proto.numParams = reader:readByte() or 0
-        proto.numUpvals = reader:readByte() or 0
-        proto.isVararg = (reader:readByte() or 0) ~= 0
-        if bodyHasFlags then
-            proto.flags = reader:readByte() or 0
-            local typeInfoSize = reader:readVarInt()
-            if typeInfoSize and typeInfoSize > 0 then
-                reader.pos = reader.pos + typeInfoSize
+-- Create bytecode reader
+function LuauDecompiler:CreateReader(data)
+    local reader = { data = data, pos = 1 }
+    
+    function reader:readByte()
+        if self.pos > #self.data then
+            return nil
+        end
+        local b = string.byte(self.data, self.pos)
+        self.pos = self.pos + 1
+        return b
+    end
+    
+    function reader:readVarInt()
+        local result = 0
+        local shift = 0
+        while true do
+            local b = self:readByte()
+            if not b then return nil end
+            result = result + bit32.lshift(bit32.band(b, 0x7F), shift)
+            if bit32.band(b, 0x80) == 0 then
+                break
             end
+            shift = shift + 7
         end
-        local instrCount = reader:readVarInt() or 0
-        proto.instructions = {}
-        for i = 1, instrCount do
-            local instr = reader:readInt32()
-            table.insert(proto.instructions, instr)
+        return result
+    end
+    
+    function reader:readDouble()
+        if self.pos + 7 > #self.data then
+            return 0
         end
-        local constCount = reader:readVarInt() or 0
-        proto.constants = {}
-        for i = 1, constCount do
-            local constType = reader:readByte() or 0
-            local value
-            if constType == 0 then
-                value = nil
-            elseif constType == 1 then
-                local b = reader:readByte() or 0
-                value = (b ~= 0)
-            elseif constType == 2 then
-                value = reader:readDouble()
-            elseif constType == 3 then
-                local strIdx = reader:readVarInt() or 0
-                value = strings[(strIdx or 0) + 1]
-            elseif constType == 4 then
-                local id = reader:readVarInt() or 0
-                value = { type = "import", id = id }
-            elseif constType == 5 then
-                local keys = reader:readVarInt() or 0
-                value = { type = "table", size = keys }
-                for j = 1, keys do reader:readVarInt() end
-            elseif constType == 6 then
-                local protoIdx = reader:readVarInt() or 0
-                value = { type = "closure", proto = protoIdx }
-            else
-                value = nil
-            end
-            table.insert(proto.constants, value)
+        local bytes = {string.byte(self.data, self.pos, self.pos + 7)}
+        self.pos = self.pos + 8
+        
+        -- Convert bytes to double (simplified - may need proper IEEE 754 conversion)
+        local sign = bit32.rshift(bytes[8], 7)
+        local exponent = bit32.lshift(bit32.band(bytes[8], 0x7F), 4) + bit32.rshift(bytes[7], 4)
+        local mantissa = bit32.band(bytes[7], 0x0F)
+        
+        for i = 6, 1, -1 do
+            mantissa = mantissa * 256 + bytes[i]
         end
-        local debugSize = reader:readVarInt() or 0
-        if debugSize > 0 then reader.pos = reader.pos + debugSize end
-        return proto
+        
+        if exponent == 0 then
+            return 0
+        elseif exponent == 0x7FF then
+            return math.huge
+        else
+            local value = (1 + mantissa / 2^52) * 2^(exponent - 1023)
+            return sign == 1 and -value or value
+        end
     end
-
-    local savePos = reader.pos
-    local ok, proto = pcall(parse, false)
-    if ok and proto and #proto.instructions > 0 then
-        return proto
-    end
-    -- fallback with flags/type info
-    reader.pos = savePos
-    local ok2, proto2 = pcall(parse, true)
-    if ok2 and proto2 then
-        return proto2
-    end
-    -- as last resort, return empty proto
-    return { maxStackSize = 0, numParams = 0, numUpvals = 0, isVararg = false, instructions = {}, constants = {} }
-end
+    
+    function reader:readInt32()
+        if self.pos + 3 > #self.data then
+            return 0
+        end
         local b1, b2, b3, b4 = string.byte(self.data, self.pos, self.pos + 3)
         self.pos = self.pos + 4
         return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
     end
     
+    function reader:readString()
+        -- Read null-terminated string
+        local start = self.pos
+        while self.pos <= #self.data do
+            if string.byte(self.data, self.pos) == 0 then
+                local str = string.sub(self.data, start, self.pos - 1)
+                self.pos = self.pos + 1
+                return str
+            end
+            self.pos = self.pos + 1
+        end
+        return string.sub(self.data, start)
+    end
+    
     function reader:readBytes(len)
         if self.pos + len - 1 > #self.data then
-            error("readBytes exceeds bytecode size")
+            return ""
         end
         local s = string.sub(self.data, self.pos, self.pos + len - 1)
         self.pos = self.pos + len
@@ -132,101 +134,30 @@ function LuauDecompiler:ParseBytecode(bytecode)
     end
     result.version = version
     
-    -- Read string table (blob + offsets)
-    -- Layout: [stringDataSize][stringData][stringCount][offsets...] where 
-    -- each string at offset starts with varint length followed by bytes
-    local stringDataSize = reader:readVarInt()
-    local stringData = reader:readBytes(stringDataSize)
+    -- Read string table
     local stringCount = reader:readVarInt()
-    if stringCount > 200000 then error("Invalid string count: " .. stringCount) end
-    local offsets = {}
-    for i = 1, stringCount do
-        offsets[i] = reader:readVarInt()
-    end
-    
-    local function readVarIntFromBlob(blob, pos)
-        local res, shift = 0, 0
-        local i = pos
-        while true do
-            local b = string.byte(blob, i)
-            i = i + 1
-            res = res + bit32.lshift(bit32.band(b, 0x7F), shift)
-            if bit32.band(b, 0x80) == 0 then break end
-            shift = shift + 7
-        end
-        return res, i
-    end
-    
     result.strings = {}
     for i = 1, stringCount do
-        local off = offsets[i] + 1 -- 1-based in Lua
-        local len, nextPos = readVarIntFromBlob(stringData, off)
-        local s = string.sub(stringData, nextPos, nextPos + len - 1)
-        result.strings[i] = s
+        local str = reader:readString()
+        result.strings[i] = str
     end
     
     -- Read proto table count
     local protoCount = reader:readVarInt()
-    if protoCount > 10000 then -- Sanity check
+    if protoCount > 10000 then
         error("Invalid proto count: " .. protoCount)
     end
     
     result.protos = {}
     
-    -- Read main proto first
-    local mainProto = self:ReadProto(reader, result.strings)
-    table.insert(result.protos, mainProto)
-    
-    -- Read child protos
-    for i = 2, protoCount do
+    -- Read protos
+    for i = 1, protoCount do
         local proto = self:ReadProto(reader, result.strings)
         table.insert(result.protos, proto)
     end
     
-    result.mainProto = result.protos[1]
+    result.mainProto = result.protos[1] or { instructions = {}, constants = {} }
     
-    -- Heuristic fallback: if instruction list is empty, try scanning the blob
-    if #result.mainProto.instructions == 0 then
-        local function isValidOpcode(b)
-            return b and b >= 0 and b <= 82
-        end
-        local blob = bytecode
-        local bestStart, bestLen = nil, 0
-        local i = 1
-        local blobLen = #blob
-        -- scan in 4-byte steps, look for the longest run of valid opcodes
-        while i + 3 <= blobLen do
-            local b = string.byte(blob, i)
-            if isValidOpcode(b) then
-                local j = i
-                local count = 0
-                while j + 3 <= blobLen do
-                    local op = string.byte(blob, j)
-                    if not isValidOpcode(op) then break end
-                    count = count + 1
-                    j = j + 4
-                end
-                if count > bestLen then
-                    bestLen = count
-                    bestStart = i
-                end
-                i = j
-            else
-                i = i + 1
-            end
-        end
-        if bestStart and bestLen > 4 then
-            local inst = {}
-            local pos = bestStart
-            for k = 1, bestLen do
-                local b1, b2, b3, b4 = string.byte(blob, pos, pos + 3)
-                local word = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-                table.insert(inst, word)
-                pos = pos + 4
-            end
-            result.mainProto.instructions = inst
-        end
-    end
     return result
 end
 
@@ -240,15 +171,12 @@ function LuauDecompiler:ReadProto(reader, strings)
     proto.numUpvals = reader:readByte()
     proto.isVararg = reader:readByte() ~= 0
     
-    -- Flags byte (new in recent versions)
-    if reader:hasMore() then
-        proto.flags = reader:readByte()
-    end
+    -- Read flags byte if version >= 4
+    proto.flags = reader:readByte()
     
-    -- Read type info if present
+    -- Read type info size and skip it
     local typeInfoSize = reader:readVarInt()
     if typeInfoSize > 0 then
-        -- Skip type info for now
         reader.pos = reader.pos + typeInfoSize
     end
     
@@ -266,27 +194,26 @@ function LuauDecompiler:ReadProto(reader, strings)
     for i = 1, constCount do
         local constType = reader:readByte()
         local value
-        -- Tags based on Luau BytecodeTag: 0=nil,1=bool,2=number,3=string,4=import,5=table,6=function
-        if constType == 0 then
+        
+        if constType == 0 then -- nil
             value = nil
-        elseif constType == 1 then
-            local b = reader:readByte()
-            value = (b ~= 0)
-        elseif constType == 2 then
+        elseif constType == 1 then -- boolean
+            value = reader:readByte() ~= 0
+        elseif constType == 2 then -- number
             value = reader:readDouble()
-        elseif constType == 3 then
+        elseif constType == 3 then -- string
             local strIdx = reader:readVarInt()
-            value = strings[(strIdx or 0) + 1]
-        elseif constType == 4 then
-            -- import: refer to GETIMPORT path indices; keep as placeholder
+            value = strings[strIdx + 1]
+        elseif constType == 4 then -- import
             local id = reader:readVarInt()
             value = { type = "import", id = id }
-        elseif constType == 5 then
-            -- table template: skip payload for now
+        elseif constType == 5 then -- table
             local keys = reader:readVarInt()
             value = { type = "table", size = keys }
-            for j = 1, keys do reader:readVarInt() end
-        elseif constType == 6 then
+            for j = 1, keys do
+                reader:readVarInt()
+            end
+        elseif constType == 6 then -- closure
             local protoIdx = reader:readVarInt()
             value = { type = "closure", proto = protoIdx }
         else
@@ -296,7 +223,7 @@ function LuauDecompiler:ReadProto(reader, strings)
         table.insert(proto.constants, value)
     end
     
-    -- Read debug info size and skip it
+    -- Read debug info size and skip
     local debugSize = reader:readVarInt()
     if debugSize > 0 then
         reader.pos = reader.pos + debugSize
@@ -313,30 +240,14 @@ local function INSN_C(insn) return bit32.band(bit32.rshift(insn, 24), 0xFF) end
 local function INSN_D(insn) return bit32.rshift(insn, 16) end
 local function INSN_E(insn) return bit32.rshift(insn, 8) end
 
--- Decompile a single instruction
 -- Structured decompilation with AUX handling and expression building
 local AUX_OPS = {
     GETGLOBAL = true, SETGLOBAL = true, GETIMPORT = true, GETTABLEKS = true, SETTABLEKS = true,
-    NAMECALL = true, SETLIST = true, LOADKX = true, JUMPX = true, JUMPIFEQ = true, JUMPIFLE = true,
-    JUMPIFLT = true, JUMPIFNOTEQ = true, JUMPIFNOTLE = true, JUMPIFNOTLT = true, JUMPXEQKNIL = true,
-    JUMPXEQKB = true, JUMPXEQKN = true, JUMPXEQKS = true, FASTCALL3 = true, FASTCALL2 = true,
+    NAMECALL = true, SETLIST = true, LOADKX = true, JUMPX = true, FASTCALL3 = true, FASTCALL2 = true,
 }
 
 local function needsAux(opname)
     return AUX_OPS[opname] == true
-end
-
-local function decodeAuxPath(aux)
-    -- AUX packs up to 3 10-bit indices, top 2 bits store path length (1..3)
-    local len = bit32.rshift(aux, 30)
-    if len < 1 or len > 3 then len = 1 end
-    local idx1 = bit32.band(aux, 0x3FF)
-    local idx2 = bit32.band(bit32.rshift(aux, 10), 0x3FF)
-    local idx3 = bit32.band(bit32.rshift(aux, 20), 0x3FF)
-    local idxs = {idx1}
-    if len >= 2 then table.insert(idxs, idx2) end
-    if len >= 3 then table.insert(idxs, idx3) end
-    return idxs
 end
 
 local function quote(s)
@@ -348,6 +259,7 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
     local out = {}
     local regs = {}
     local declared = {}
+    
     local function setreg(r, expr)
         regs[r] = expr
         if not declared[r] then
@@ -357,19 +269,22 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
             table.insert(out, string.format("R%d = %s", r, expr))
         end
     end
+    
     local function getreg(r)
         return regs[r] or ("R" .. r)
     end
 
     local i = 1
     local n = #proto.instructions
-    local lastClosure -- track most recent NEWCLOSURE for CAPTUREs
+    local lastClosure = nil
+    
     while i <= n do
         local instr = proto.instructions[i]
         local op = INSN_OP(instr)
         local opname = OpCodes[op] or ("UNKNOWN_" .. op)
         local A, B, C, D = INSN_A(instr), INSN_B(instr), INSN_C(instr), INSN_D(instr)
         local aux, consumed = nil, 1
+        
         if needsAux(opname) and (i + 1) <= n then
             aux = proto.instructions[i + 1]
             consumed = 2
@@ -380,7 +295,7 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
         elseif opname == "LOADB" then
             setreg(A, B ~= 0 and "true" or "false")
         elseif opname == "LOADN" then
-            setreg(A, tostring(bit32.rshift(instr, 16)))
+            setreg(A, tostring(D))
         elseif opname == "LOADK" then
             local k = proto.constants[D + 1]
             if type(k) == "string" then
@@ -393,131 +308,150 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
                 setreg(A, "nil")
             end
         elseif opname == "LOADKX" and aux then
-            local idx = aux
-            local k = proto.constants[(idx or 0) + 1]
+            local k = proto.constants[aux + 1]
             setreg(A, type(k) == "string" and quote(k) or tostring(k))
         elseif opname == "MOVE" then
             setreg(A, getreg(B))
         elseif opname == "GETGLOBAL" and aux then
-            local nameIdx = aux
-            local name = proto.constants[(nameIdx or 0) + 1]
-            name = type(name) == "string" and name or ("CONST_" .. tostring(nameIdx or 0))
-            setreg(A, string.format("_G[%s]", quote(name)))
+            local name = proto.constants[aux + 1]
+            if type(name) == "string" then
+                setreg(A, name)
+            else
+                setreg(A, "_G[?]")
+            end
         elseif opname == "SETGLOBAL" and aux then
-            local nameIdx = aux
-            local name = proto.constants[(nameIdx or 0) + 1]
-            name = type(name) == "string" and name or ("CONST_" .. tostring(nameIdx or 0))
-            table.insert(out, string.format("_G[%s] = %s", quote(name), getreg(A)))
+            local name = proto.constants[aux + 1]
+            if type(name) == "string" then
+                table.insert(out, string.format("%s = %s", name, getreg(A)))
+            else
+                table.insert(out, string.format("_G[?] = %s", getreg(A)))
+            end
         elseif opname == "GETTABLE" then
             setreg(A, string.format("%s[%s]", getreg(B), getreg(C)))
         elseif opname == "SETTABLE" then
             table.insert(out, string.format("%s[%s] = %s", getreg(B), getreg(C), getreg(A)))
-    elseif opname == "GETTABLEKS" and aux then
-            local keyIdx = aux
-            local key = proto.constants[(keyIdx or 0) + 1]
-            if type(key) ~= "string" then key = tostring(key) end
-            setreg(A, string.format("%s.%s", getreg(B), key))
-        elseif opname == "SETTABLEKS" and aux then
-            local keyIdx = aux
-            local key = proto.constants[(keyIdx or 0) + 1]
-            if type(key) ~= "string" then key = tostring(key) end
-            table.insert(out, string.format("%s.%s = %s", getreg(B), key, getreg(A)))
-        elseif opname == "GETIMPORT" then
-            -- Build from AUX path if available, else from D as constant index
-            local expr = ""
-            if aux then
-                local idxs = decodeAuxPath(aux)
-                local parts = {}
-                for _, idx in ipairs(idxs) do
-                    local s = bytecodeInfo.strings[(idx or 0) + 1]
-                    table.insert(parts, type(s) == "string" and s or ("STR_" .. tostring(idx)))
-                end
-                -- Heuristic build: game:GetService("X") vs script.Parent etc.
-                if parts[1] == "game" and parts[2] == "GetService" and parts[3] then
-                    expr = string.format("game:GetService(%s)", quote(parts[3]))
-                elseif parts[1] == "workspace" then
-                    expr = "workspace"
-                elseif parts[1] == "script" then
-                    if parts[2] then expr = "script." .. parts[2] else expr = "script" end
-                else
-                    expr = table.concat(parts, ".")
-                end
+        elseif opname == "GETTABLEKS" and aux then
+            local key = proto.constants[aux + 1]
+            if type(key) == "string" then
+                setreg(A, string.format("%s.%s", getreg(B), key))
             else
-                local k = proto.constants[D + 1]
-                expr = type(k) == "string" and k or "import"
+                setreg(A, string.format("%s[?]", getreg(B)))
             end
-            setreg(A, expr)
+        elseif opname == "SETTABLEKS" and aux then
+            local key = proto.constants[aux + 1]
+            if type(key) == "string" then
+                table.insert(out, string.format("%s.%s = %s", getreg(B), key, getreg(A)))
+            else
+                table.insert(out, string.format("%s[?] = %s", getreg(B), getreg(A)))
+            end
+        elseif opname == "GETIMPORT" then
+            if aux then
+                -- Decode import path from aux
+                local count = bit32.rshift(aux, 30) + 1
+                local id0 = bit32.band(aux, 0x3FF)
+                local id1 = bit32.band(bit32.rshift(aux, 10), 0x3FF)
+                local id2 = bit32.band(bit32.rshift(aux, 20), 0x3FF)
+                
+                local parts = {}
+                if count >= 1 and bytecodeInfo.strings[id0 + 1] then
+                    table.insert(parts, bytecodeInfo.strings[id0 + 1])
+                end
+                if count >= 2 and bytecodeInfo.strings[id1 + 1] then
+                    table.insert(parts, bytecodeInfo.strings[id1 + 1])
+                end
+                if count >= 3 and bytecodeInfo.strings[id2 + 1] then
+                    table.insert(parts, bytecodeInfo.strings[id2 + 1])
+                end
+                
+                local expr = "import"
+                if #parts > 0 then
+                    if parts[1] == "game" and parts[2] == "GetService" and parts[3] then
+                        expr = string.format("game:GetService(%q)", parts[3])
+                    elseif parts[1] == "workspace" then
+                        expr = "workspace"
+                    else
+                        expr = table.concat(parts, ".")
+                    end
+                end
+                setreg(A, expr)
+            else
+                setreg(A, "import")
+            end
         elseif opname == "NEWCLOSURE" then
-            -- D is child proto index
             local childIdx = D
             local cl = { __closure = true, proto = childIdx, captures = {} }
             regs[A] = cl
-            declared[A] = declared[A] or true
+            declared[A] = true
             lastClosure = cl
         elseif opname == "CAPTURE" then
-            -- Capture upvalues for the last created closure
             if lastClosure then
-                local src = getreg(B)
-                table.insert(lastClosure.captures, src)
+                table.insert(lastClosure.captures, getreg(B))
             end
         elseif opname == "NAMECALL" and aux then
-            -- Prepare method call; actual call emitted on CALL
-            local methodIdx = aux
-            local method = proto.constants[(methodIdx or 0) + 1]
-            if type(method) ~= "string" then method = tostring(methodIdx or "method") end
-            -- Store a sentinel representing a prepared namecall
-            regs[A] = { __namecall = true, obj = getreg(B), method = method }
-            if not declared[A] then declared[A] = true end
+            local method = proto.constants[aux + 1]
+            if type(method) == "string" then
+                regs[A] = { __namecall = true, obj = getreg(B), method = method }
+                declared[A] = true
+            end
         elseif opname == "CALL" then
             local funcExpr = regs[A]
             local args = {}
-            -- args are in A+1..A+B-1
-            for r = A + 1, A + math.max(B - 1, 0) do
+            
+            for r = A + 1, A + B - 1 do
                 local ar = regs[r]
                 if type(ar) == "table" and ar.__closure then
-                    -- render inline closure with upvalue note
                     local upv = (#ar.captures > 0) and (" --[[ captures: " .. table.concat(ar.captures, ", ") .. " ]]") or ""
                     table.insert(args, "function(...) end" .. upv)
                 else
                     table.insert(args, getreg(r))
                 end
             end
-            local callStr = nil
+            
+            local callStr
             if type(funcExpr) == "table" and funcExpr.__namecall then
-                -- Convert NAMECALL into obj:method(args)
-                local obj = funcExpr.obj
-                -- First arg is self; drop it if it's obj
-                if #args > 0 and args[1] == obj then table.remove(args, 1) end
-                callStr = string.format("%s:%s(%s)", obj, funcExpr.method, table.concat(args, ", "))
+                callStr = string.format("%s:%s(%s)", funcExpr.obj, funcExpr.method, table.concat(args, ", "))
             else
                 callStr = string.format("%s(%s)", getreg(A), table.concat(args, ", "))
             end
 
-            if C == 0 then
-                table.insert(out, callStr)
-            elseif C == 1 then
+            if C == 0 or C == 1 then
                 table.insert(out, callStr)
             else
-                -- Capture results into R[A..A+C-2]
                 local rets = {}
-                for r = A, A + C - 2 do table.insert(rets, "R" .. r) end
-                for _, rname in ipairs(rets) do
-                    local rnum = tonumber(rname:sub(2))
-                    declared[rnum] = declared[rnum] or true
+                for r = A, A + C - 2 do
+                    table.insert(rets, "R" .. r)
+                    declared[r] = true
                 end
                 table.insert(out, string.format("local %s = %s", table.concat(rets, ", "), callStr))
-                for idx, rname in ipairs(rets) do
-                    local rnum = tonumber(rname:sub(2))
-                    regs[rnum] = rname
-                end
             end
+        elseif opname == "RETURN" then
+            if B == 0 or B == 1 then
+                table.insert(out, "return")
+            else
+                local vals = {}
+                for r = A, A + B - 2 do
+                    table.insert(vals, getreg(r))
+                end
+                table.insert(out, "return " .. table.concat(vals, ", "))
+            end
+        elseif opname == "JUMP" then
+            local offset = D - 32768
+            table.insert(out, string.format("-- jump %+d", offset))
+        elseif opname == "JUMPIF" then
+            local offset = D - 32768
+            table.insert(out, string.format("if %s then --[[ jump %+d ]] end", getreg(A), offset))
+        elseif opname == "JUMPIFNOT" then
+            local offset = D - 32768
+            table.insert(out, string.format("if not %s then --[[ jump %+d ]] end", getreg(A), offset))
         elseif opname == "NEWTABLE" then
             setreg(A, "{}")
         elseif opname == "DUPTABLE" then
-            setreg(A, "{--[[template]]}")
+            setreg(A, "{}")
         elseif opname == "CONCAT" then
             local parts = {}
-            for r = B, C do table.insert(parts, getreg(r)) end
+            for r = B, C do
+                table.insert(parts, getreg(r))
+            end
             setreg(A, table.concat(parts, " .. "))
         elseif opname == "NOT" then
             setreg(A, "not " .. getreg(B))
@@ -525,21 +459,18 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
             setreg(A, "-" .. getreg(B))
         elseif opname == "LENGTH" then
             setreg(A, "#" .. getreg(B))
-        elseif opname == "RETURN" then
-            if B == 0 or B == 1 then
-                table.insert(out, "return")
-            else
-                local vals = {}
-                for r = A, A + B - 2 do table.insert(vals, getreg(r)) end
-                table.insert(out, "return " .. table.concat(vals, ", "))
-            end
-        elseif opname == "JUMPIF" or opname == "JUMPIFNOT" then
-            -- Emit simple conditional; full structuring is out-of-scope here
-            local cond = (opname == "JUMPIF") and getreg(A) or ("not " .. getreg(A))
-            table.insert(out, string.format("if %s then --[[ jump %+d ]] end", cond, (bit32.rshift(instr,16)-32768)))
-        elseif opname == "JUMP" or opname == "JUMPBACK" then
-            table.insert(out, string.format("-- jump %+d", (bit32.rshift(instr,16)-32768)))
-        
+        elseif opname == "ADD" then
+            setreg(A, string.format("%s + %s", getreg(B), getreg(C)))
+        elseif opname == "SUB" then
+            setreg(A, string.format("%s - %s", getreg(B), getreg(C)))
+        elseif opname == "MUL" then
+            setreg(A, string.format("%s * %s", getreg(B), getreg(C)))
+        elseif opname == "DIV" then
+            setreg(A, string.format("%s / %s", getreg(B), getreg(C)))
+        elseif opname == "MOD" then
+            setreg(A, string.format("%s %% %s", getreg(B), getreg(C)))
+        elseif opname == "POW" then
+            setreg(A, string.format("%s ^ %s", getreg(B), getreg(C)))
         else
             table.insert(out, string.format("-- %s A:%d B:%d C:%d D:%d", opname, A, B, C, D))
         end
@@ -556,20 +487,10 @@ function LuauDecompiler:Decompile(proto, bytecodeInfo, level)
     local output = {}
     
     if level == 0 then
-        table.insert(output, "-- Universal Luau Decompiler V2")
+        table.insert(output, "-- Universal Luau Decompiler V3")
         table.insert(output, "-- Bytecode Version: " .. bytecodeInfo.version)
         table.insert(output, "-- String Count: " .. #bytecodeInfo.strings)
         table.insert(output, "-- Proto Count: " .. #bytecodeInfo.protos)
-        table.insert(output, "")
-        table.insert(output, "-- String Table:")
-        for i, str in ipairs(bytecodeInfo.strings) do
-            if i <= 20 then -- Show first 20 strings
-                table.insert(output, string.format("-- [%d] = %q", i-1, str))
-            end
-        end
-        if #bytecodeInfo.strings > 20 then
-            table.insert(output, "-- ... and " .. (#bytecodeInfo.strings - 20) .. " more strings")
-        end
         table.insert(output, "")
     end
     
@@ -580,11 +501,14 @@ function LuauDecompiler:Decompile(proto, bytecodeInfo, level)
                          ", upvals: " .. proto.numUpvals .. 
                          ", vararg: " .. tostring(proto.isVararg) .. ")")
     
-    table.insert(output, indent .. "-- Instructions: " .. #proto.instructions)
-    -- Use structured pass with AUX handling and expression reconstruction
-    local body = self:DecompileStructured(proto, bytecodeInfo)
-    for line in string.gmatch(body, "[^\n]+") do
-        table.insert(output, indent .. line)
+    if #proto.instructions > 0 then
+        table.insert(output, indent .. "-- Instructions: " .. #proto.instructions)
+        local body = self:DecompileStructured(proto, bytecodeInfo)
+        for line in string.gmatch(body, "[^\n]+") do
+            table.insert(output, indent .. line)
+        end
+    else
+        table.insert(output, indent .. "-- No instructions found")
     end
     
     table.insert(output, "")
@@ -624,16 +548,16 @@ function decompilev2(input)
         error("Failed to get bytecode or bytecode is empty")
     end
     
-    print("🚀 Universal Luau Decompiler V3 - Structured")
+    print("🚀 Universal Luau Decompiler V3")
     print("📊 Bytecode size: " .. #bytecode .. " bytes")
     
     -- Attempt decompilation
     local success, result = pcall(function()
         local bytecodeInfo = LuauDecompiler:ParseBytecode(bytecode)
-    local decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
-    local elapsed = os.clock() - t0
-    local header = string.format("-- Decompiled on %s\n-- Time taken: %.6f seconds\n", os.date("%Y-%m-%d %H:%M:%S"), elapsed)
-    decompiledCode = header .. decompiledCode
+        local decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
+        local elapsed = os.clock() - t0
+        local header = string.format("-- Decompiled on %s\n-- Time taken: %.6f seconds\n", os.date("%Y-%m-%d %H:%M:%S"), elapsed)
+        decompiledCode = header .. decompiledCode
         
         -- Add remaining protos
         for i = 2, #bytecodeInfo.protos do
@@ -647,8 +571,8 @@ function decompilev2(input)
             print("✅ Decompilation saved to: " .. outputPath)
         end
         
-    print("✅ Decompilation completed!")
-    print(string.format("⏱️ Time: %.6fs", elapsed))
+        print("✅ Decompilation completed!")
+        print(string.format("⏱️ Time: %.6fs", elapsed))
         print("📏 Instructions processed: " .. #bytecodeInfo.mainProto.instructions)
         
         return decompiledCode
@@ -664,7 +588,7 @@ end
 -- Set global
 _G.decompilev2 = decompilev2
 
-print("🌍 Universal Luau Decompiler V2 Loaded!")
+print("🌍 Universal Luau Decompiler V3 Loaded!")
 print("💡 Usage: decompilev2(script_or_path)")
 
 return LuauDecompiler
