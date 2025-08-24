@@ -1,4 +1,3 @@
-
 --[[
     Universal Roblox Luau Bytecode Decompiler
     Built for exploit environments with getscriptbytecode access
@@ -93,7 +92,10 @@ function LuauDecompiler:ReadBytecode(bytecode)
     
     local function readString()
         local len = readInt32()
-        if not len or len == 0 then return "" end
+        if not len or len < 0 or len > 1000000 then -- Prevent huge strings
+            return nil
+        end
+        if len == 0 then return "" end
         if pos + len - 1 > #bytecode then return nil end
         local str = string.sub(bytecode, pos, pos + len - 1)
         pos = pos + len
@@ -118,6 +120,9 @@ function LuauDecompiler:ReadBytecode(bytecode)
     
     -- Parse string table
     local stringCount = readInt32()
+    if not stringCount or stringCount < 0 or stringCount > 100000 then
+        error("Invalid string count: " .. tostring(stringCount))
+    end
     local strings = {}
     for i = 1, stringCount do
         local str = readString()
@@ -128,6 +133,9 @@ function LuauDecompiler:ReadBytecode(bytecode)
     
     -- Parse number table
     local numberCount = readInt32()
+    if not numberCount or numberCount < 0 or numberCount > 100000 then
+        error("Invalid number count: " .. tostring(numberCount))
+    end
     local numbers = {}
     for i = 1, numberCount do
         local num = readDouble()
@@ -138,6 +146,9 @@ function LuauDecompiler:ReadBytecode(bytecode)
     
     -- Parse proto table (function definitions)
     local protoCount = readInt32()
+    if not protoCount or protoCount < 0 or protoCount > 10000 then
+        error("Invalid proto count: " .. tostring(protoCount))
+    end
     local protos = {}
     
     for i = 1, protoCount do
@@ -149,6 +160,9 @@ function LuauDecompiler:ReadBytecode(bytecode)
         
         -- Read instructions
         local instrCount = readInt32()
+        if not instrCount or instrCount < 0 or instrCount > 1000000 then
+            error("Invalid instruction count: " .. tostring(instrCount))
+        end
         proto.instructions = {}
         for j = 1, instrCount do
             local instr = readInt32()
@@ -159,6 +173,9 @@ function LuauDecompiler:ReadBytecode(bytecode)
         
         -- Read constants
         local constCount = readInt32()
+        if not constCount or constCount < 0 or constCount > 100000 then
+            error("Invalid constant count: " .. tostring(constCount))
+        end
         proto.constants = {}
         for j = 1, constCount do
             local constType = readByte()
@@ -169,16 +186,27 @@ function LuauDecompiler:ReadBytecode(bytecode)
                 value = readByte() == 1
             elseif constType == 2 then -- number
                 local idx = readInt32()
-                value = numbers[idx + 1]
+                if idx and idx >= 0 and idx < #numbers then
+                    value = numbers[idx + 1]
+                else
+                    value = 0 -- fallback for invalid index
+                end
             elseif constType == 3 then -- string
                 local idx = readInt32()
-                value = strings[idx + 1]
+                if idx and idx >= 0 and idx < #strings then
+                    value = strings[idx + 1]
+                else
+                    value = "" -- fallback for invalid index
+                end
             end
             table.insert(proto.constants, value)
         end
         
         -- Read child protos
         local childCount = readInt32()
+        if not childCount or childCount < 0 or childCount > 10000 then
+            error("Invalid child proto count: " .. tostring(childCount))
+        end
         proto.childProtos = {}
         for j = 1, childCount do
             local childIdx = readInt32()
@@ -254,6 +282,9 @@ end
 
 -- Resolve import path
 function LuauDecompiler:ResolveImport(constantIdx, state)
+    if constantIdx < 0 or constantIdx >= #state.proto.constants then
+        return "unknown"
+    end
     local constant = state.proto.constants[constantIdx + 1]
     if type(constant) == "string" then
         -- Check if it's a Roblox service
