@@ -132,7 +132,9 @@ function LuauDecompiler:ParseBytecode(bytecode)
     local signature = reader:readBytes(4)
     reader.pos = 1 -- Reset position
     
-    if signature == "RSB1" then
+    local isRSB1Format = (signature == "RSB1")
+    
+    if isRSB1Format then
         -- Standard Luau bytecode format
         reader:readBytes(4) -- Skip signature
         result.version = reader:readByte()
@@ -186,7 +188,7 @@ function LuauDecompiler:ParseBytecode(bytecode)
     
     -- Read proto table count
     local protoCount = 0
-    if signature == "RSB1" then
+    if isRSB1Format then
         protoCount = reader:readVarInt() or 0
         if protoCount > 10000 then
             error("Invalid proto count: " .. tostring(protoCount))
