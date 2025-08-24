@@ -603,6 +603,8 @@ function LuauDecompiler:ReconstructFromStrings(strings)
     
     return output
 end
+
+function LuauDecompiler:Decompile(proto, bytecodeInfo, level)
     level = level or 0
     local output = {}
     
