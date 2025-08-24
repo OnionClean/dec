@@ -130,7 +130,7 @@ function LuauDecompiler:ParseBytecode(bytecode)
     -- Read header
     local version = reader:readByte()
     if version < 3 or version > 6 then
-        error("Unsupported bytecode version: " .. version)
+        error("Unsupported bytecode version: " .. tostring(version))
     end
     result.version = version
     
@@ -145,7 +145,7 @@ function LuauDecompiler:ParseBytecode(bytecode)
     -- Read proto table count
     local protoCount = reader:readVarInt()
     if protoCount > 10000 then
-        error("Invalid proto count: " .. protoCount)
+        error("Invalid proto count: " .. tostring(protoCount))
     end
     
     result.protos = {}
@@ -488,21 +488,21 @@ function LuauDecompiler:Decompile(proto, bytecodeInfo, level)
     
     if level == 0 then
         table.insert(output, "-- Universal Luau Decompiler V3")
-        table.insert(output, "-- Bytecode Version: " .. bytecodeInfo.version)
-        table.insert(output, "-- String Count: " .. #bytecodeInfo.strings)
-        table.insert(output, "-- Proto Count: " .. #bytecodeInfo.protos)
+        table.insert(output, "-- Bytecode Version: " .. tostring(bytecodeInfo.version))
+        table.insert(output, "-- String Count: " .. tostring(#bytecodeInfo.strings))
+        table.insert(output, "-- Proto Count: " .. tostring(#bytecodeInfo.protos))
         table.insert(output, "")
     end
     
     local indent = string.rep("  ", level)
     
-    table.insert(output, indent .. "-- Function (params: " .. proto.numParams .. 
-                         ", stack: " .. proto.maxStackSize .. 
-                         ", upvals: " .. proto.numUpvals .. 
+    table.insert(output, indent .. "-- Function (params: " .. tostring(proto.numParams) .. 
+                         ", stack: " .. tostring(proto.maxStackSize) .. 
+                         ", upvals: " .. tostring(proto.numUpvals) .. 
                          ", vararg: " .. tostring(proto.isVararg) .. ")")
     
     if #proto.instructions > 0 then
-        table.insert(output, indent .. "-- Instructions: " .. #proto.instructions)
+        table.insert(output, indent .. "-- Instructions: " .. tostring(#proto.instructions))
         local body = self:DecompileStructured(proto, bytecodeInfo)
         for line in string.gmatch(body, "[^\n]+") do
             table.insert(output, indent .. line)
@@ -518,7 +518,7 @@ end
 
 -- Main entry point
 function decompilev2(input)
-    local t0 = os.clock()
+    local t0 = tick and tick() or 0  -- Use tick() if available, otherwise 0
     local bytecode
     local outputPath
     
@@ -555,8 +555,14 @@ function decompilev2(input)
     local success, result = pcall(function()
         local bytecodeInfo = LuauDecompiler:ParseBytecode(bytecode)
         local decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
-        local elapsed = os.clock() - t0
-        local header = string.format("-- Decompiled on %s\n-- Time taken: %.6f seconds\n", os.date("%Y-%m-%d %H:%M:%S"), elapsed)
+        local elapsed = tick and (tick() - t0) or 0
+        
+        -- Create header without using os.date which might not be available
+        local header = "-- Universal Luau Decompiler V3\n"
+        if elapsed > 0 then
+            header = header .. string.format("-- Time taken: %.6f seconds\n", elapsed)
+        end
+        
         decompiledCode = header .. decompiledCode
         
         -- Add remaining protos
@@ -572,8 +578,10 @@ function decompilev2(input)
         end
         
         print("✅ Decompilation completed!")
-        print(string.format("⏱️ Time: %.6fs", elapsed))
-        print("📏 Instructions processed: " .. #bytecodeInfo.mainProto.instructions)
+        if elapsed > 0 then
+            print(string.format("⏱️ Time: %.6fs", elapsed))
+        end
+        print("📏 Instructions processed: " .. tostring(#bytecodeInfo.mainProto.instructions))
         
         return decompiledCode
     end)
