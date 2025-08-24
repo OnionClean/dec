@@ -184,6 +184,49 @@ function LuauDecompiler:ParseBytecode(bytecode)
     end
     
     result.mainProto = result.protos[1]
+    
+    -- Heuristic fallback: if instruction list is empty, try scanning the blob
+    if #result.mainProto.instructions == 0 then
+        local function isValidOpcode(b)
+            return b and b >= 0 and b <= 82
+        end
+        local blob = bytecode
+        local bestStart, bestLen = nil, 0
+        local i = 1
+        local blobLen = #blob
+        -- scan in 4-byte steps, look for the longest run of valid opcodes
+        while i + 3 <= blobLen do
+            local b = string.byte(blob, i)
+            if isValidOpcode(b) then
+                local j = i
+                local count = 0
+                while j + 3 <= blobLen do
+                    local op = string.byte(blob, j)
+                    if not isValidOpcode(op) then break end
+                    count = count + 1
+                    j = j + 4
+                end
+                if count > bestLen then
+                    bestLen = count
+                    bestStart = i
+                end
+                i = j
+            else
+                i = i + 1
+            end
+        end
+        if bestStart and bestLen > 4 then
+            local inst = {}
+            local pos = bestStart
+            for k = 1, bestLen do
+                local b1, b2, b3, b4 = string.byte(blob, pos, pos + 3)
+                local word = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+                table.insert(inst, word)
+                pos = pos + 4
+            end
+            result.mainProto.instructions = inst
+        end
+    end
     return result
 end
 
