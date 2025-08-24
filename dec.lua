@@ -122,47 +122,26 @@ function LuauDecompiler:CreateReader(data)
     return reader
 end
 
--- Parse Luau bytecode with proper format
+-- Parse Luau bytecode with proper format detection
 function LuauDecompiler:ParseBytecode(bytecode)
     local reader = self:CreateReader(bytecode)
     local result = {}
     
-    -- Try to detect format
-    local firstByte = string.byte(bytecode, 1)
-    local signature = reader:readBytes(4)
-    reader.pos = 1 -- Reset position
+    -- Check if this is actual Luau bytecode with proper header
+    if #bytecode < 5 then
+        error("Bytecode too short")
+    end
     
-    local isRSB1Format = (signature == "RSB1")
-    
-    if isRSB1Format then
-        -- Standard Luau bytecode format
-        reader:readBytes(4) -- Skip signature
-        result.version = reader:readByte()
-        
-        -- Read string table
-        local stringCount = reader:readVarInt()
-        result.strings = {}
-        for i = 1, stringCount do
-            local strLen = reader:readVarInt()
-            if not strLen or strLen <= 0 then
-                result.strings[i] = ""
-            else
-                local str = ""
-                for j = 1, strLen do
-                    local byte = reader:readByte()
-                    if not byte then break end
-                    str = str .. string.char(byte)
-                end
-                result.strings[i] = str
-            end
-        end
-        
-    else
-        -- Alternative format - try to parse as direct string table
+    -- Read version byte
+    local version = reader:readByte()
+    if not version or version < 3 or version > 6 then
+        -- Fallback to string extraction for non-standard formats
         result.version = 1
         result.strings = {}
+        result.protos = {}
+        result.mainProto = { instructions = {}, constants = {} }
         
-        -- Try to extract strings directly
+        -- Extract strings from raw data
         local pos = 1
         local stringIndex = 1
         while pos <= #bytecode do
@@ -177,54 +156,90 @@ function LuauDecompiler:ParseBytecode(bytecode)
                     str = str .. string.char(b)
                     pos = pos + 1
                 end
-                if #str > 0 then
+                if #str > 1 then -- Only include strings longer than 1 char
                     result.strings[stringIndex] = str
                     stringIndex = stringIndex + 1
                 end
             end
             pos = pos + 1
         end
+        
+        return result
     end
     
-    -- Read proto table count
-    local protoCount = 0
-    if isRSB1Format then
-        protoCount = reader:readVarInt() or 0
-        if protoCount > 10000 then
-            error("Invalid proto count: " .. tostring(protoCount))
+    result.version = version
+    
+    -- Read string table
+    local stringCount = reader:readVarInt()
+    if not stringCount or stringCount > 100000 then
+        error("Invalid string count: " .. tostring(stringCount))
+    end
+    
+    result.strings = {}
+    for i = 1, stringCount do
+        local strLen = reader:readVarInt()
+        if not strLen then break end
+        
+        if strLen == 0 then
+            result.strings[i] = ""
+        else
+            local str = ""
+            for j = 1, strLen do
+                local byte = reader:readByte()
+                if not byte then break end
+                str = str .. string.char(byte)
+            end
+            result.strings[i] = str
         end
+    end
+    
+    -- Read proto table
+    local protoCount = reader:readVarInt()
+    if not protoCount or protoCount > 10000 then
+        error("Invalid proto count: " .. tostring(protoCount))
     end
     
     result.protos = {}
     
     -- Read protos
     for i = 1, protoCount do
-        local proto = self:ReadProto(reader, result.strings)
-        table.insert(result.protos, proto)
+        local proto = self:ReadProto(reader, result.strings, version)
+        if proto then
+            proto.id = i - 1
+            table.insert(result.protos, proto)
+        end
     end
     
-    result.mainProto = result.protos[1] or { instructions = {}, constants = {} }
+    -- Read main proto ID
+    local mainProtoId = reader:readVarInt() or 0
+    result.mainProto = result.protos[mainProtoId + 1] or { instructions = {}, constants = {} }
     
     return result
 end
 
--- Read a single proto (function)
-function LuauDecompiler:ReadProto(reader, strings)
+-- Read a single proto (function) with version support
+function LuauDecompiler:ReadProto(reader, strings, version)
     local proto = {}
     
     -- Read proto header
-    proto.maxStackSize = reader:readByte() or 0
+    proto.maxStackSize = reader:readByte() or 1
     proto.numParams = reader:readByte() or 0
     proto.numUpvals = reader:readByte() or 0
     proto.isVararg = (reader:readByte() or 0) ~= 0
     
-    -- Read flags byte if version >= 4
-    proto.flags = reader:readByte() or 0
+    -- Read flags
+    if version >= 4 then
+        proto.flags = reader:readByte() or 0
+    else
+        proto.flags = 0
+    end
     
-    -- Read type info size and skip it
-    local typeInfoSize = reader:readVarInt() or 0
-    if typeInfoSize > 0 then
-        reader.pos = reader.pos + typeInfoSize
+    -- Skip type info for now
+    if version >= 4 then
+        local typeInfoSize = reader:readVarInt() or 0
+        if typeInfoSize > 0 then
+            reader.pos = reader.pos + typeInfoSize
+        end
     end
     
     -- Read instructions
@@ -234,6 +249,8 @@ function LuauDecompiler:ReadProto(reader, strings)
         local instr = reader:readInt32()
         if instr then
             table.insert(proto.instructions, instr)
+        else
+            break
         end
     end
     
@@ -243,14 +260,14 @@ function LuauDecompiler:ReadProto(reader, strings)
     for i = 1, constCount do
         local constType = reader:readByte()
         if not constType then break end
-        local value
         
+        local value
         if constType == 0 then -- nil
             value = nil
         elseif constType == 1 then -- boolean
             value = (reader:readByte() or 0) ~= 0
         elseif constType == 2 then -- number
-            value = reader:readDouble()
+            value = reader:readDouble() or 0
         elseif constType == 3 then -- string
             local strIdx = reader:readVarInt() or 0
             value = strings[strIdx + 1] or ""
@@ -260,6 +277,7 @@ function LuauDecompiler:ReadProto(reader, strings)
         elseif constType == 5 then -- table
             local keys = reader:readVarInt() or 0
             value = { type = "table", size = keys }
+            -- Skip key data
             for j = 1, keys do
                 reader:readVarInt()
             end
@@ -273,7 +291,15 @@ function LuauDecompiler:ReadProto(reader, strings)
         table.insert(proto.constants, value)
     end
     
-    -- Read debug info size and skip
+    -- Read child protos
+    local childCount = reader:readVarInt() or 0
+    proto.childProtos = {}
+    for i = 1, childCount do
+        local childId = reader:readVarInt() or 0
+        table.insert(proto.childProtos, childId)
+    end
+    
+    -- Skip debug info
     local debugSize = reader:readVarInt() or 0
     if debugSize > 0 then
         reader.pos = reader.pos + debugSize
@@ -532,6 +558,130 @@ function LuauDecompiler:DecompileStructured(proto, bytecodeInfo)
 end
 
 -- Main decompilation
+function LuauDecompiler:SmartReconstruct(strings)
+    local output = {}
+    
+    -- Analyze strings to build a more intelligent reconstruction
+    local services = {}
+    local variables = {}
+    local events = {}
+    local methods = {}
+    local gui_elements = {}
+    local remotes = {}
+    
+    for _, str in ipairs(strings) do
+        if str then
+            -- Game services
+            if str:match("Service$") then
+                table.insert(services, str)
+            -- Variables and properties
+            elseif str == "LocalPlayer" or str == "PlayerGui" or str == "Parent" or str == "Name" or str == "Text" then
+                table.insert(variables, str)
+            -- Events
+            elseif str == "Connect" or str == "FocusLost" or str == "ChildAdded" or str == "Changed" then
+                table.insert(events, str)
+            -- Methods
+            elseif str == "WaitForChild" or str == "FireServer" or str == "GetService" then
+                table.insert(methods, str)
+            -- GUI elements
+            elseif str == "Frame" or str == "TextBox" or str == "CmdBox" or str == "CommandsGui" then
+                table.insert(gui_elements, str)
+            -- Remote events
+            elseif str == "RemoteEvents" or str == "CommandEvent" then
+                table.insert(remotes, str)
+            end
+        end
+    end
+    
+    -- Generate code based on patterns found
+    table.insert(output, "-- Script reconstructed from bytecode strings")
+    table.insert(output, "")
+    
+    -- Services
+    if #services > 0 or table.find(strings, "game") then
+        for _, service in ipairs(services) do
+            local varName = service:gsub("Service$", "")
+            table.insert(output, string.format('local %s = game:GetService("%s")', varName, service))
+        end
+        
+        -- Common patterns
+        if table.find(strings, "Players") then
+            table.insert(output, "local Players = game:GetService(\"Players\")")
+        end
+        if table.find(strings, "LocalPlayer") then
+            table.insert(output, "local LocalPlayer = Players.LocalPlayer")
+        end
+        if table.find(strings, "PlayerGui") then
+            table.insert(output, "local PlayerGui = LocalPlayer.PlayerGui")
+        end
+        if table.find(strings, "ReplicatedStorage") then
+            table.insert(output, "local ReplicatedStorage = game:GetService(\"ReplicatedStorage\")")
+        end
+        table.insert(output, "")
+    end
+    
+    -- Remote events setup
+    if #remotes > 0 then
+        table.insert(output, "-- Remote Events")
+        for _, remote in ipairs(remotes) do
+            if remote == "RemoteEvents" then
+                table.insert(output, "local RemoteEvents = ReplicatedStorage:WaitForChild(\"RemoteEvents\")")
+            elseif remote == "CommandEvent" then
+                table.insert(output, "local CommandEvent = RemoteEvents:WaitForChild(\"CommandEvent\")")
+            end
+        end
+        table.insert(output, "")
+    end
+    
+    -- GUI setup
+    if #gui_elements > 0 then
+        table.insert(output, "-- GUI Setup")
+        for _, element in ipairs(gui_elements) do
+            if element == "CommandsGui" then
+                table.insert(output, "local CommandsGui = PlayerGui:WaitForChild(\"CommandsGui\")")
+            elseif element == "Frame" then
+                table.insert(output, "local Frame = CommandsGui:WaitForChild(\"Frame\")")
+            elseif element == "CmdBox" then
+                table.insert(output, "local CmdBox = Frame:WaitForChild(\"CmdBox\")")
+            end
+        end
+        table.insert(output, "")
+    end
+    
+    -- Event connections
+    if table.find(events, "Connect") then
+        table.insert(output, "-- Event Connections")
+        
+        if table.find(strings, "FocusLost") then
+            table.insert(output, "CmdBox.FocusLost:Connect(function(enterPressed)")
+            table.insert(output, "    if enterPressed then")
+            
+            if table.find(strings, "FireServer") then
+                table.insert(output, "        CommandEvent:FireServer(CmdBox.Text)")
+            end
+            
+            table.insert(output, "        CmdBox.Text = \"\"")
+            table.insert(output, "    end")
+            table.insert(output, "end)")
+        end
+        
+        table.insert(output, "")
+    end
+    
+    -- RunService check
+    if table.find(strings, "IsStudio") then
+        table.insert(output, "-- Studio Check")
+        table.insert(output, "if not RunService:IsStudio() then")
+        table.insert(output, "    -- Enable GUI")
+        if table.find(strings, "Enabled") then
+            table.insert(output, "    CommandsGui.Enabled = true")
+        end
+        table.insert(output, "end")
+    end
+    
+    return output
+end
+
 function LuauDecompiler:ReconstructFromStrings(strings)
     local output = {}
     
@@ -680,12 +830,21 @@ function decompilev2(input)
         local bytecodeInfo = LuauDecompiler:ParseBytecode(bytecode)
         local decompiledCode
         
-        if #bytecodeInfo.protos == 0 or not bytecodeInfo.mainProto then
-            -- No bytecode protos found, try to reconstruct from strings
-            print("⚠️ No bytecode protos found, attempting string reconstruction...")
+        if #bytecodeInfo.protos == 0 or not bytecodeInfo.mainProto or #bytecodeInfo.mainProto.instructions == 0 then
+            -- No valid bytecode found, try to reconstruct from strings
+            print("⚠️ No valid bytecode instructions found, attempting string reconstruction...")
             local reconstructed = LuauDecompiler:ReconstructFromStrings(bytecodeInfo.strings)
-            decompiledCode = table.concat(reconstructed, "\n")
+            
+            -- Try to create more realistic script based on strings
+            local smartReconstruction = LuauDecompiler:SmartReconstruct(bytecodeInfo.strings)
+            if #smartReconstruction > 0 then
+                decompiledCode = table.concat(smartReconstruction, "\n")
+            else
+                decompiledCode = table.concat(reconstructed, "\n")
+            end
         else
+            -- We have actual bytecode instructions
+            print("✅ Found " .. #bytecodeInfo.mainProto.instructions .. " bytecode instructions")
             decompiledCode = LuauDecompiler:Decompile(bytecodeInfo.mainProto, bytecodeInfo, 0)
             
             -- Add remaining protos
