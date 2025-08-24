@@ -30,82 +30,87 @@ local OpCodes = {
 }
 
 -- Bytecode reader with proper varint support
-function LuauDecompiler:CreateReader(bytecode)
-    local reader = {
-        data = bytecode,
-        pos = 1
-    }
-    
-    function reader:readByte()
-        if self.pos > #self.data then 
-            error("Unexpected end of bytecode at position " .. self.pos)
+function LuauDecompiler:ReadProto(reader, strings)
+    local function parse(bodyHasFlags)
+        local proto = {}
+        proto.maxStackSize = reader:readByte() or 0
+        proto.numParams = reader:readByte() or 0
+        proto.numUpvals = reader:readByte() or 0
+        proto.isVararg = (reader:readByte() or 0) ~= 0
+        if bodyHasFlags then
+            proto.flags = reader:readByte() or 0
+            local typeInfoSize = reader:readVarInt()
+            if typeInfoSize and typeInfoSize > 0 then
+                reader.pos = reader.pos + typeInfoSize
+            end
         end
-        local byte = string.byte(self.data, self.pos)
-        self.pos = self.pos + 1
-        return byte
+        local instrCount = reader:readVarInt() or 0
+        proto.instructions = {}
+        for i = 1, instrCount do
+            local instr = reader:readInt32()
+            table.insert(proto.instructions, instr)
+        end
+        local constCount = reader:readVarInt() or 0
+        proto.constants = {}
+        for i = 1, constCount do
+            local constType = reader:readByte() or 0
+            local value
+            if constType == 0 then
+                value = nil
+            elseif constType == 1 then
+                local b = reader:readByte() or 0
+                value = (b ~= 0)
+            elseif constType == 2 then
+                value = reader:readDouble()
+            elseif constType == 3 then
+                local strIdx = reader:readVarInt() or 0
+                value = strings[(strIdx or 0) + 1]
+            elseif constType == 4 then
+                local id = reader:readVarInt() or 0
+                value = { type = "import", id = id }
+            elseif constType == 5 then
+                local keys = reader:readVarInt() or 0
+                value = { type = "table", size = keys }
+                for j = 1, keys do reader:readVarInt() end
+            elseif constType == 6 then
+                local protoIdx = reader:readVarInt() or 0
+                value = { type = "closure", proto = protoIdx }
+            else
+                value = nil
+            end
+            table.insert(proto.constants, value)
+        end
+        local debugSize = reader:readVarInt() or 0
+        if debugSize > 0 then reader.pos = reader.pos + debugSize end
+        return proto
     end
-    
-    -- Read variable-length integer (Luau format)
-    function reader:readVarInt()
-        local result = 0
-        local shift = 0
-        repeat
-            local byte = self:readByte()
-            result = result + bit32.lshift(bit32.band(byte, 0x7F), shift)
-            shift = shift + 7
-        until bit32.band(byte, 0x80) == 0
-        return result
+
+    local savePos = reader.pos
+    local ok, proto = pcall(parse, false)
+    if ok and proto and #proto.instructions > 0 then
+        return proto
     end
-    
-    function reader:readString()
-        local len = self:readVarInt()
-        if len == 0 then return "" end
-        if self.pos + len - 1 > #self.data then
-            error("String length exceeds bytecode size")
-        end
-        local str = string.sub(self.data, self.pos, self.pos + len - 1)
-        self.pos = self.pos + len
-        return str
+    -- fallback with flags/type info
+    reader.pos = savePos
+    local ok2, proto2 = pcall(parse, true)
+    if ok2 and proto2 then
+        return proto2
     end
-    
-    function reader:readFloat()
-        if self.pos + 3 > #self.data then
-            error("Float read exceeds bytecode size")
-        end
-        local bytes = {string.byte(self.data, self.pos, self.pos + 3)}
-        self.pos = self.pos + 4
-        -- Convert 4 bytes to float (little-endian)
-        local n = bytes[1] + bytes[2] * 256 + bytes[3] * 65536 + bytes[4] * 16777216
-        -- IEEE 754 conversion
-        local sign = bit32.rshift(n, 31) == 1 and -1 or 1
-        local exp = bit32.band(bit32.rshift(n, 23), 0xFF)
-        local mantissa = bit32.band(n, 0x7FFFFF)
-        
-        if exp == 0 then
-            return sign * mantissa * (2 ^ -149)
-        elseif exp == 0xFF then
-            return mantissa == 0 and (sign * math.huge) or 0/0
-        else
-            return sign * (1 + mantissa / 8388608) * (2 ^ (exp - 127))
-        end
-    end
-    
-    function reader:readDouble()
-        if self.pos + 7 > #self.data then
-            error("Double read exceeds bytecode size")
-        end
-        local str = string.sub(self.data, self.pos, self.pos + 7)
-        self.pos = self.pos + 8
-        return string.unpack("<d", str)
-    end
-    
-    function reader:readInt32()
-        if self.pos + 3 > #self.data then
-            error("Int32 read exceeds bytecode size")
-        end
+    -- as last resort, return empty proto
+    return { maxStackSize = 0, numParams = 0, numUpvals = 0, isVararg = false, instructions = {}, constants = {} }
+end
         local b1, b2, b3, b4 = string.byte(self.data, self.pos, self.pos + 3)
         self.pos = self.pos + 4
         return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    end
+    
+    function reader:readBytes(len)
+        if self.pos + len - 1 > #self.data then
+            error("readBytes exceeds bytecode size")
+        end
+        local s = string.sub(self.data, self.pos, self.pos + len - 1)
+        self.pos = self.pos + len
+        return s
     end
     
     function reader:hasMore()
@@ -127,16 +132,37 @@ function LuauDecompiler:ParseBytecode(bytecode)
     end
     result.version = version
     
-    -- Read string table count (varint)
+    -- Read string table (blob + offsets)
+    -- Layout: [stringDataSize][stringData][stringCount][offsets...] where 
+    -- each string at offset starts with varint length followed by bytes
+    local stringDataSize = reader:readVarInt()
+    local stringData = reader:readBytes(stringDataSize)
     local stringCount = reader:readVarInt()
-    if stringCount > 100000 then -- Sanity check
-        error("Invalid string count: " .. stringCount)
+    if stringCount > 200000 then error("Invalid string count: " .. stringCount) end
+    local offsets = {}
+    for i = 1, stringCount do
+        offsets[i] = reader:readVarInt()
+    end
+    
+    local function readVarIntFromBlob(blob, pos)
+        local res, shift = 0, 0
+        local i = pos
+        while true do
+            local b = string.byte(blob, i)
+            i = i + 1
+            res = res + bit32.lshift(bit32.band(b, 0x7F), shift)
+            if bit32.band(b, 0x80) == 0 then break end
+            shift = shift + 7
+        end
+        return res, i
     end
     
     result.strings = {}
     for i = 1, stringCount do
-        local str = reader:readString()
-        table.insert(result.strings, str)
+        local off = offsets[i] + 1 -- 1-based in Lua
+        local len, nextPos = readVarIntFromBlob(stringData, off)
+        local s = string.sub(stringData, nextPos, nextPos + len - 1)
+        result.strings[i] = s
     end
     
     -- Read proto table count
@@ -197,31 +223,31 @@ function LuauDecompiler:ReadProto(reader, strings)
     for i = 1, constCount do
         local constType = reader:readByte()
         local value
-        
-        if constType == 0 then -- nil
+        -- Tags based on Luau BytecodeTag: 0=nil,1=bool,2=number,3=string,4=import,5=table,6=function
+        if constType == 0 then
             value = nil
-        elseif constType == 1 then -- boolean false
-            value = false
-        elseif constType == 2 then -- boolean true
-            value = true
-        elseif constType == 3 then -- number
+        elseif constType == 1 then
+            local b = reader:readByte()
+            value = (b ~= 0)
+        elseif constType == 2 then
             value = reader:readDouble()
-        elseif constType == 4 then -- string
+        elseif constType == 3 then
             local strIdx = reader:readVarInt()
-            value = strings[strIdx + 1]
-        elseif constType == 5 then -- import (global)
-            local importIdx = reader:readInt32()
-            value = {type = "import", id = importIdx}
-        elseif constType == 6 then -- table
+            value = strings[(strIdx or 0) + 1]
+        elseif constType == 4 then
+            -- import: refer to GETIMPORT path indices; keep as placeholder
+            local id = reader:readVarInt()
+            value = { type = "import", id = id }
+        elseif constType == 5 then
+            -- table template: skip payload for now
             local keys = reader:readVarInt()
-            value = {type = "table", size = keys}
-            -- Skip table data
-            for j = 1, keys do
-                reader:readVarInt() -- key index
-            end
-        elseif constType == 7 then -- closure
+            value = { type = "table", size = keys }
+            for j = 1, keys do reader:readVarInt() end
+        elseif constType == 6 then
             local protoIdx = reader:readVarInt()
-            value = {type = "closure", proto = protoIdx}
+            value = { type = "closure", proto = protoIdx }
+        else
+            value = nil
         end
         
         table.insert(proto.constants, value)
